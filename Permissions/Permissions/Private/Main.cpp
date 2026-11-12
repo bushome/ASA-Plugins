@@ -16,8 +16,10 @@
 
 #pragma comment(lib, "AsaApi.lib")
 
-// Manage all async calls
-thread_pool pool;
+// Runs the background database sync. Created at the end of Load(), not as a global: its threads
+// can't start while the loader lock is held, so a pool built during DLL load and torn down by a
+// failed load would wait on them forever.
+std::unique_ptr<thread_pool> pool;
 namespace Permissions
 {
 	nlohmann::json config;
@@ -860,6 +862,9 @@ namespace Permissions
 
 	void DatabaseSync()
 	{
+		if (!pool)
+			return;
+
 		if (difftime(time(0), lastDatabaseSyncTime) >= SyncFrequency)
 		{
 			// Skip this round if the previous sync is still reading (slow or unreachable database),
@@ -867,7 +872,7 @@ namespace Permissions
 			bool expected = false;
 			if (syncInProgress.compare_exchange_strong(expected, true))
 			{
-				pool.push_task(
+				pool->push_task(
 					[]()
 					{
 						database->Init();
@@ -880,37 +885,51 @@ namespace Permissions
 		}
 	}
 
-	void ReadConfig()
+	// Reads config.json. On failure, logs why and returns false, leaving the current settings untouched.
+	bool ReadConfig()
 	{
-		const std::string config_path = GetConfigPath();
-		std::ifstream file{ config_path };
-		if (!file.is_open())
-			throw std::runtime_error("Can't open config.json");
+		nlohmann::json loaded;
+		try
+		{
+			std::ifstream file{ GetConfigPath() };
+			if (!file.is_open())
+			{
+				Log::GetLog()->error("Can't open config.json");
+				return false;
+			}
+			file >> loaded;
+			if (!loaded.is_object())
+			{
+				Log::GetLog()->error("config.json must contain a JSON object");
+				return false;
+			}
 
-		file >> config;
+			const bool hideAll = loaded.value("HideAllPlayerSuccessMessages", false);
+			const bool asNotification = loaded.value("SendMessagesAsNotification", false);
+			const float textSize = loaded.value("TextSize", 1.5f);
+			const float displayTime = loaded.value("DisplayTime", 3.0f);
 
-		HideAllPlayerSuccessMessages = config.value("HideAllPlayerSuccessMessages", false);
-		SendMessagesAsNotification = config.value("SendMessagesAsNotification", false);
-
-		TextSize = config.value("TextSize", 1.5f);
-		DisplayTime = config.value("DisplayTime", 3.0f);
-
-		file.close();
+			config = std::move(loaded);
+			HideAllPlayerSuccessMessages = hideAll;
+			SendMessagesAsNotification = asNotification;
+			TextSize = textSize;
+			DisplayTime = displayTime;
+			return true;
+		}
+		catch (const std::exception& error)
+		{
+			Log::GetLog()->error("Can't read config.json: {}", error.what());
+			return false;
+		}
 	}
 
 	void ReloadConfig(APlayerController* player_controller, FString* /*unused*/, bool /*unused*/)
 	{
 		auto* shooter_controller = static_cast<AShooterPlayerController*>(player_controller);
 
-		try
+		if (!ReadConfig())
 		{
-			ReadConfig();
-		}
-		catch (const std::exception& error)
-		{
-			AsaApi::GetApiUtils().SendServerMessage(shooter_controller, FColorList::Red, "Failed to reload config");
-
-			Log::GetLog()->error(error.what());
+			AsaApi::GetApiUtils().SendServerMessage(shooter_controller, FColorList::Red, "Failed to reload config, kept the current settings");
 			return;
 		}
 
@@ -921,15 +940,9 @@ namespace Permissions
 	{
 		FString reply;
 
-		try
+		if (!ReadConfig())
 		{
-			ReadConfig();
-		}
-		catch (const std::exception& error)
-		{
-			Log::GetLog()->error(error.what());
-
-			reply = error.what();
+			reply = "Failed to reload config, kept the current settings (see the Permissions log)";
 			rcon_connection->SendMessageW(rcon_packet->Id, 0, &reply);
 			return;
 		}
@@ -942,20 +955,16 @@ namespace Permissions
 	{
 		Log::Get().Init("Permission");
 
-		try
+		// A missing or broken config.json doesn't stop the plugin: it runs on defaults (SQLite at the default path).
+		if (!ReadConfig())
 		{
-			ReadConfig();
-
-			SyncFrequency = config.value("ClusterSyncTime", 60);
-			if (SyncFrequency < 20)
-				SyncFrequency = 20;
-
+			Log::GetLog()->error("Using default settings");
+			config = nlohmann::json::object();
 		}
-		catch (const std::exception& error)
-		{
-			Log::GetLog()->error(error.what());
-			throw;
-		}
+
+		SyncFrequency = config.value("ClusterSyncTime", 60);
+		if (SyncFrequency < 20)
+			SyncFrequency = 20;
 
 		if (config.value("UseMysql", false))
 		{
@@ -1020,7 +1029,8 @@ namespace Permissions
 
 		AsaApi::GetCommands().AddOnTimerCallback("DatabaseSync", &DatabaseSync);
 
-		pool.sleep_duration = 20000; // "if not set, default is 1ms which is overkill and will increase cpu usage a lot" - @Lethal 2021
+		pool = std::make_unique<thread_pool>();
+		pool->sleep_duration = 20000; // "if not set, default is 1ms which is overkill and will increase cpu usage a lot" - @Lethal 2021
 	}
 }
 
@@ -1029,7 +1039,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 	switch (ul_reason_for_call)
 	{
 	case DLL_PROCESS_ATTACH:
-		// An exception must not escape DllMain. Returning FALSE makes the plugin fail to load cleanly (the reason is already logged).
+		// An exception must not escape DllMain. Returning FALSE makes the plugin fail to load cleanly. This is safe
+		// only because Load() creates the thread pool last, so a failure leaves no threads behind to join.
 		try
 		{
 			Permissions::Load();
