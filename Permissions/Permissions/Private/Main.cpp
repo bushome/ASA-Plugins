@@ -6,6 +6,7 @@
 
 #include "Main.h"
 
+#include <atomic>
 #include <fstream>
 
 #include "../Public/Permissions.h"
@@ -232,7 +233,7 @@ namespace Permissions
 	void RemovePlayerFromTimedGroupCmd(APlayerController* player_controller, FString* cmd, bool)
 	{
 		auto result = RemovePlayerFromTimedGroup(*cmd);
-		HandlePlayerMessage(player_controller, result, "Successfully aremoved player from timed group.");
+		HandlePlayerMessage(player_controller, result, "Successfully removed player from timed group.");
 
 	}
 
@@ -240,7 +241,7 @@ namespace Permissions
 	{
 		auto result = RemovePlayerFromTimedGroup(rcon_packet->Body);
 		if (!result.has_value())
-			SendRconReply(rcon_connection, rcon_packet->Id, "Successfully aremoved player from timed group.");
+			SendRconReply(rcon_connection, rcon_packet->Id, "Successfully removed player from timed group.");
 		else
 			SendRconReply(rcon_connection, rcon_packet->Id, result.value().c_str());
 	}
@@ -416,7 +417,7 @@ namespace Permissions
 	{
 		auto result = RemoveTribeFromTimedGroup(rcon_packet->Body);
 		if (!result.has_value())
-			SendRconReply(rcon_connection, rcon_packet->Id, "Successfully aremoved tribe from timed group.");
+			SendRconReply(rcon_connection, rcon_packet->Id, "Successfully removed tribe from timed group.");
 		else
 			SendRconReply(rcon_connection, rcon_packet->Id, result.value().c_str());
 	}
@@ -557,27 +558,27 @@ namespace Permissions
 			days = secsLeft / 86400;
 			if (days > 0 && intervalsToShow > shown) {
 				if (timeLeft.size() > 0) timeLeft += ", ";
-				timeLeft += fmt::format("{} Day{}", (int)days, (days >= 1 ? "s" : ""));
+				timeLeft += fmt::format("{} Day{}", (int)days, (days > 1 ? "s" : ""));
 				secsLeft -= days * 86400;
 				shown++;
 			}
 			hours = secsLeft / 3600;
 			if (hours > 0 && intervalsToShow > shown) {
 				if (timeLeft.size() > 0) timeLeft += ", ";
-				timeLeft += fmt::format("{} Hr{}", (int)hours, (hours >= 1 ? "s" : ""));
+				timeLeft += fmt::format("{} Hr{}", (int)hours, (hours > 1 ? "s" : ""));
 				secsLeft -= hours * 3600;
 				shown++;
 			}
 			mins = secsLeft / 60;
 			if (mins > 0 && intervalsToShow > shown) {
 				if (timeLeft.size() > 0) timeLeft += ", ";
-				timeLeft += fmt::format("{} Min{}", (int)mins, (mins >= 1 ? "s" : ""));
+				timeLeft += fmt::format("{} Min{}", (int)mins, (mins > 1 ? "s" : ""));
 				secsLeft -= mins * 60;
 				shown++;
 			}
 			if (secsLeft > 0 && intervalsToShow > shown) {
 				if (timeLeft.size() > 0) timeLeft += ", ";
-				timeLeft += fmt::format("{} Sec{}", (int)secsLeft, (secsLeft >= 1 ? "s" : ""));
+				timeLeft += fmt::format("{} Sec{}", (int)secsLeft, (secsLeft > 1 ? "s" : ""));
 				shown++;
 			}
 		}
@@ -655,43 +656,23 @@ namespace Permissions
 			}
 		}
 
-		auto world = AsaApi::GetApiUtils().GetWorld();
-		if (world)
+		// Add the tribe groups of this player's own tribe (only known while they're online).
+		AShooterPlayerController* shooter_pc = AsaApi::GetApiUtils().FindPlayerFromEOSID(eos_id);
+		if (FTribeData* tribeData = Permissions::GetTribeData(shooter_pc))
 		{
-			const auto& player_controllers = world->PlayerControllerListField();
-			for (TWeakObjectPtr<APlayerController> player_controller : player_controllers)
+			const auto tribeId = tribeData->TribeIDField();
+			if (tribeId > 0)
 			{
-				APlayerController* pc = player_controller.Get();
-				if (pc)
+				FString defaults = "";
+				for (const auto& tribeGroup : GetTribeDefaultGroups(tribeData))
 				{
-					AShooterPlayerController* shooter_pc = static_cast<AShooterPlayerController*>(pc);
-					if (shooter_pc)
-					{
-						auto tribeData = Permissions::GetTribeData(shooter_pc);
-						if (tribeData)
-						{
-							auto tribeId = tribeData->TribeIDField();
-							if (tribeId > 0)
-							{
-								auto defaultTribeGroups = GetTribeDefaultGroups(tribeData);
-								FString defaults = "";
-								for (auto tribeGroup : defaultTribeGroups)
-								{
-									if (defaults.Len() > 0) defaults += ", ";
-									defaults += tribeGroup;
-								}
-								FString tribeStr = GetTribeGroupsStr(defaults, tribeId, forChat);
-								if (groups_str.Len() > 0 && tribeStr.Len() > 0)
-									groups_str += "\n";
-								groups_str += tribeStr;
-							}
-						}
-					}
-					else
-						Log::GetLog()->error("({} {}) AShooterPlayerController is null", __FILE__, __FUNCTION__);
+					if (defaults.Len() > 0) defaults += ", ";
+					defaults += tribeGroup;
 				}
-				else
-					Log::GetLog()->error("({} {}) APlayerController is null", __FILE__, __FUNCTION__);
+				FString tribeStr = GetTribeGroupsStr(defaults, tribeId, forChat);
+				if (groups_str.Len() > 0 && tribeStr.Len() > 0)
+					groups_str += "\n";
+				groups_str += tribeStr;
 			}
 		}
 
@@ -865,13 +846,25 @@ namespace Permissions
 		AsaApi::GetApiUtils().SendChatMessage(player_controller, L"Permissions", *groups_str);
 	}
 
+	std::atomic<bool> syncInProgress{ false };
+
 	void DatabaseSync()
 	{
 		if (difftime(time(0), lastDatabaseSyncTime) >= SyncFrequency)
 		{
-			pool.push_task(
-				[]() { database->Init(); }
-			);
+			// Skip this round if the previous sync is still reading (slow or unreachable database),
+			// rather than queueing overlapping reads on the same connection.
+			bool expected = false;
+			if (syncInProgress.compare_exchange_strong(expected, true))
+			{
+				pool.push_task(
+					[]()
+					{
+						database->Init();
+						syncInProgress = false;
+					}
+				);
+			}
 
 			lastDatabaseSyncTime = time(0);
 		}
@@ -1026,7 +1019,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 	switch (ul_reason_for_call)
 	{
 	case DLL_PROCESS_ATTACH:
-		Permissions::Load();
+		// An exception must not escape DllMain. Returning FALSE makes the plugin fail to load cleanly (the reason is already logged).
+		try
+		{
+			Permissions::Load();
+		}
+		catch (...)
+		{
+			return FALSE;
+		}
 		break;
 	case DLL_PROCESS_DETACH:
 		break;
